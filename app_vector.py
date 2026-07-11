@@ -12,9 +12,21 @@ import jieba
 from hot_questions_manager import HotQuestionsManager
 
 # ===== 配置 DeepSeek API =====
-DEEPSEEK_API_KEY = ""  # 替换成你的Key
+import streamlit as st
+
+# 从 st.secrets 读取 API Key（Streamlit Cloud 配置）
+try:
+    DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
+except Exception:
+    import os
+    DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+
+if not DEEPSEEK_API_KEY:
+    st.error("未配置 DeepSeek API Key，请在 Secrets 中添加 DEEPSEEK_API_KEY")
+    st.stop()
+
 client = OpenAI(
-    api_key=st.secrets["DEEPSEEK_API_KEY"],
+    api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com"
 )
 
