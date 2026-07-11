@@ -14,7 +14,7 @@ from hot_questions_manager import HotQuestionsManager
 # ===== 配置 DeepSeek API =====
 DEEPSEEK_API_KEY = ""  # 替换成你的Key
 client = OpenAI(
-    api_key=DEEPSEEK_API_KEY,
+    api_key=st.secrets["DEEPSEEK_API_KEY"],
     base_url="https://api.deepseek.com"
 )
 
