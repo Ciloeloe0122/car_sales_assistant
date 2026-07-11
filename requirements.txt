@@ -1,0 +1,6 @@
+streamlit
+pandas
+openai
+scikit-learn
+rank_bm25
+jieba
