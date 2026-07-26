@@ -90,6 +90,45 @@ class HotQuestionsManager:
         # 4. 构造归一化键
         return f"{car}_{intent}"
 
+    def _summarize_with_ai(self, question, client=None):
+        """
+        使用 AI 将长问题压缩成一句话（10字以内）
+        如果 client 未提供或调用失败，返回 None，后续会回退到规则提取
+        """
+        if not client or len(question) <= 15:
+            return None
+
+        # 简单的缓存：用问题原文作为键，存储提炼结果
+        cache_key = f"summary_{hash(question)}"
+        if hasattr(self, '_summary_cache') and cache_key in self._summary_cache:
+            return self._summary_cache[cache_key]
+
+        try:
+            prompt = f"""请将以下用户购车问题压缩成一句话（10个字以内），保留核心意图（车型和关键诉求）。
+    只输出压缩后的一句话，不要其他内容。
+
+    原始问题：{question}
+    压缩后："""
+
+            response = client.chat.completions.create(
+                model="deepseek-v4-flash",  # 使用快速便宜的模型
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=30
+            )
+            summary = response.choices[0].message.content.strip()
+            # 限制长度，防止意外长句
+            if len(summary) > 15:
+                summary = summary[:15]
+            # 存入缓存
+            if not hasattr(self, '_summary_cache'):
+                self._summary_cache = {}
+            self._summary_cache[cache_key] = summary
+            return summary
+        except Exception as e:
+            # 调用失败则返回 None，不影响主流程
+            return None
+
     def _get_best_display_text(self, question, normalized_key):
         """从同组问题中选一个展示文本"""
         # 优先选包含车型全称且长度适中的
@@ -102,24 +141,34 @@ class HotQuestionsManager:
         mid = len(candidates) // 2
         return candidates[mid]
 
-    def record_question(self, question):
-        """记录一个问题"""
+    def record_question(self, question,client=None):
         clean = question.strip().rstrip("？?").strip()
         if not clean:
             return
 
-        # 归一化
         normalized_key = self._normalize_question(clean)
 
-        # 记录到聚合键下
+        # ----- 新增：AI 提炼 -----
+        summary = self._summarize_with_ai(clean, client)
+        # 如果提炼成功，用 summary 作为展示名；否则保留原问法
+        display_name = summary if summary else clean
+        # ----- 新增结束 -----
+
+        # 原逻辑：初始化聚合键
         if normalized_key not in self.data["questions"]:
             self.data["questions"][normalized_key] = {
                 "count": 0,
                 "variants": [],
-                "latest": clean
+                "latest": clean,
+                "display": display_name  # 新增字段
             }
+        else:
+            # 如果已有 display，且新提炼的 summary 更短更精炼，可更新
+            existing_display = self.data["questions"][normalized_key].get("display")
+            if summary and (not existing_display or len(summary) < len(existing_display)):
+                self.data["questions"][normalized_key]["display"] = summary
 
-        # 更新计数（不重复计数同一问题）
+        # 更新计数和变体（原逻辑不变）
         self.data["questions"][normalized_key]["count"] += 1
         if clean not in self.data["questions"][normalized_key]["variants"]:
             self.data["questions"][normalized_key]["variants"].append(clean)
@@ -137,6 +186,8 @@ class HotQuestionsManager:
 
         self._clean_old_data()
         self._save()
+
+
 
     def _clean_old_data(self):
         """清理30天前数据"""
@@ -169,21 +220,18 @@ class HotQuestionsManager:
         for key, info in sorted_items:
             if isinstance(info, dict):
                 count = info.get("count", 0)
-                variants = info.get("variants", [])
+                # 优先用 display，其次用变体中的第一个，最后用 key
+                display = info.get("display")
+                if not display:
+                    variants = info.get("variants", [])
+                    display = variants[0] if variants else key
             else:
                 count = info
-                variants = [key]
-
-            display = variants[0] if variants else key
-            for v in variants:
-                if len(v) > 4 and ("红旗" in v or "H" in v):
-                    display = v
-                    break
+                display = key
 
             if display in seen:
                 continue
             seen.add(display)
-
             result.append(f"{display}（热度：{count}）")
             if len(result) >= n:
                 break

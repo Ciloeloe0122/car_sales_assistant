@@ -1,22 +1,28 @@
 import os
-os.environ["PYTHONIOENCODING"] = "utf-8"
-
 import csv
-from datetime import datetime
-
+import json
+import uuid
 import re
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+from crm import get_crm, CRM
+
+# 在应用启动时获取 CRM 实例
+crm = get_crm()
+
 import streamlit as st
-from dotenv import load_dotenv
-load_dotenv()
 import pandas as pd
-from openai import OpenAI
+import jieba
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from rank_bm25 import BM25Okapi
-import jieba
-from hot_questions_manager import HotQuestionsManager
+from openai import OpenAI
+from dotenv import load_dotenv
 
-# ===== 配置 DeepSeek API =====
+load_dotenv()
+
+# ==================== 配置 DeepSeek API ====================
 try:
     DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
 except Exception:
@@ -28,11 +34,92 @@ if not DEEPSEEK_API_KEY:
 
 client = OpenAI(
     api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com"
+    base_url="https://api.deepseek.com/v1"
 )
 
 
-# ===== 加载 CSV 数据（红旗 + 竞品） =====
+# ==================== 语义聚合版热门问题管理器 ====================
+class HotQuestionsManager:
+    def __init__(self, storage_file="data/hot_questions.json", similarity_threshold=0.6):
+        self.storage_file = storage_file
+        self.similarity_threshold = similarity_threshold
+        self.data = self._load()
+        self.vectorizer = None
+
+    def set_vectorizer(self, vectorizer):
+        self.vectorizer = vectorizer
+
+    def _load(self):
+        if os.path.exists(self.storage_file):
+            try:
+                with open(self.storage_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                return {"topics": {}, "daily": {}}
+        return {"topics": {}, "daily": {}}
+
+    def _save(self):
+        os.makedirs(os.path.dirname(self.storage_file), exist_ok=True)
+        with open(self.storage_file, 'w', encoding='utf-8') as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+    def _normalize(self, text):
+        text = text.strip().rstrip("？?").strip()
+        return text
+
+    def _find_similar_topic(self, question):
+        if not self.data["topics"] or self.vectorizer is None:
+            return None, 0.0
+        existing_topics = list(self.data["topics"].keys())
+        if not existing_topics:
+            return None, 0.0
+        question_vec = self.vectorizer.transform([question])
+        topics_vec = self.vectorizer.transform(existing_topics)
+        similarities = cosine_similarity(question_vec, topics_vec).flatten()
+        best_idx = similarities.argmax()
+        best_score = similarities[best_idx]
+        if best_score >= self.similarity_threshold:
+            return existing_topics[best_idx], best_score
+        return None, 0.0
+
+    def record_question(self, question, client=None):
+        clean = self._normalize(question)
+        if not clean:
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        similar_topic, _ = self._find_similar_topic(clean)
+        topic = similar_topic if similar_topic else clean
+
+        self.data["topics"][topic] = self.data["topics"].get(topic, 0) + 1
+        if today not in self.data["daily"]:
+            self.data["daily"][today] = {}
+        self.data["daily"][today][topic] = self.data["daily"][today].get(topic, 0) + 1
+
+        self._clean_old_data()
+        self._save()
+
+    def _clean_old_data(self):
+        cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        to_delete = [d for d in self.data["daily"].keys() if d < cutoff]
+        for d in to_delete:
+            del self.data["daily"][d]
+        total = defaultdict(int)
+        for day, topics in self.data["daily"].items():
+            for topic, count in topics.items():
+                total[topic] += count
+        self.data["topics"] = dict(total)
+
+    def get_top_questions(self, n=5):
+        sorted_topics = sorted(self.data["topics"].items(), key=lambda x: x[1], reverse=True)
+        return [topic for topic, _ in sorted_topics[:n]]
+
+    def get_hot_score(self, question):
+        clean = self._normalize(question)
+        return self.data["topics"].get(clean, 0)
+
+
+# ==================== 数据加载与索引构建 ====================
+@st.cache_data
 def load_car_data():
     try:
         df_hongqi = pd.read_csv("data/hongqi_data.csv", encoding="utf-8", dtype={"长*宽*高(mm)": str})
@@ -43,17 +130,16 @@ def load_car_data():
 
     try:
         df_competitor = pd.read_csv("data/competitor_data.csv", encoding="utf-8", dtype={"长*宽*高(mm)": str})
+        df_competitor["品牌"] = df_competitor.get("品牌", "竞品")
     except Exception as e:
         st.warning(f"竞品数据未找到，只使用红旗数据：{e}")
         df_competitor = pd.DataFrame()
 
     df = pd.concat([df_hongqi, df_competitor], ignore_index=True)
     df = df.fillna("")
-    print(f"已加载 {len(df_hongqi)} 条红旗数据 + {len(df_competitor)} 条竞品数据 = {len(df)} 条总计")
     return df
 
 
-# ===== 构建文本列表（统一小写） =====
 def build_texts(df):
     texts = []
     for _, row in df.iterrows():
@@ -62,7 +148,7 @@ def build_texts(df):
     return texts
 
 
-# ===== 向量化 =====
+@st.cache_resource
 def build_vector_index(df):
     texts = build_texts(df)
     vectorizer = TfidfVectorizer(analyzer='char', ngram_range=(2, 4))
@@ -70,14 +156,14 @@ def build_vector_index(df):
     return vectorizer, vectors, texts
 
 
-# ===== BM25 =====
+@st.cache_resource
 def build_bm25_index(df, texts):
     tokenized_texts = [list(jieba.cut(text)) for text in texts]
     bm25 = BM25Okapi(tokenized_texts)
     return bm25
 
 
-# ===== 向量检索 =====
+# ==================== 检索函数 ====================
 def vector_search(query, vectorizer, vectors, df, top_n=5):
     query_vec = vectorizer.transform([query])
     similarities = cosine_similarity(query_vec, vectors).flatten()
@@ -87,7 +173,6 @@ def vector_search(query, vectorizer, vectors, df, top_n=5):
     return results
 
 
-# ===== BM25 检索 =====
 def bm25_search(query, bm25, df, texts, top_n=5):
     tokenized_query = list(jieba.cut(query))
     scores = bm25.get_scores(tokenized_query)
@@ -97,26 +182,20 @@ def bm25_search(query, bm25, df, texts, top_n=5):
     return results
 
 
-# ===== 检索（数值排序兜底 + 多路召回 + 多车型对比） =====
 def search_car(query, vectorizer, vectors, bm25, df, texts, top_n=3):
     query_lower = query.lower()
 
-    # 1. 多车型对比召回（H9 vs H5）
+    # 1. 多车型对比召回
     car_keywords = ['h9', 'h5', 'hs5', 'hs7', 'h6', 'eqm5', 'ehs9', 'hs3', 'hq9']
-    matched_cars = []
-    for kw in car_keywords:
-        if kw in query_lower:
-            matched_cars.append(kw)
+    matched_cars = [kw for kw in car_keywords if kw in query_lower]
 
     if len(matched_cars) >= 2:
-        condition = False
+        condition = pd.Series([False] * len(df))
         for car in matched_cars:
-            mask = df['车型'].str.lower().str.contains(car)
-            condition = condition | mask
+            condition = condition | df['车型'].str.lower().str.contains(car, na=False)
         result_df = df[condition].copy()
         if not result_df.empty:
-            print(f"检测到多车型对比：{matched_cars}，共召回 {len(result_df)} 条数据")
-            return result_df, texts
+            return result_df, texts, matched_cars
 
     # 2. 数值排序兜底
     numeric_keywords = {
@@ -136,12 +215,12 @@ def search_car(query, vectorizer, vectors, bm25, df, texts, top_n=3):
                 full_df = df.copy()
                 full_df[field] = pd.to_numeric(full_df[field], errors='coerce')
                 full_df = full_df.dropna(subset=[field])
-                full_df = full_df.sort_values(by=field, ascending=ascending)
-                result_df = full_df.head(top_n)
-                print(f"触发全局排序：{keyword} -> {field} {'升序' if ascending else '降序'}")
-                return result_df, texts
+                if not full_df.empty:
+                    full_df = full_df.sort_values(by=field, ascending=ascending)
+                    result_df = full_df.head(top_n)
+                    return result_df, texts, matched_cars
 
-    # 3. 多路召回
+    # 3. 多路召回 (向量 + BM25)
     vec_results = vector_search(query_lower, vectorizer, vectors, df, top_n=5)
     bm25_results = bm25_search(query_lower, bm25, df, texts, top_n=5)
 
@@ -154,11 +233,82 @@ def search_car(query, vectorizer, vectors, bm25, df, texts, top_n=3):
             merged_indices.append(idx)
 
     result_df = df.iloc[merged_indices].head(top_n)
-    return result_df, texts
+    return result_df, texts, matched_cars
 
 
-# ===== 生成回答 =====
-def generate_response(query, results_df, texts):
+def log_user_interaction(session_id, customer_id, user_input, ai_response, retrieved_models, matched_cars):
+    log_file = "data/user_logs.csv"
+    file_exists = os.path.exists(log_file)
+    header = ["timestamp", "session_id", "customer_id", "user_input", "ai_response", "retrieved_models", "matched_cars"]
+
+    with open(log_file, mode='a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        if not file_exists or os.path.getsize(log_file) == 0:
+            writer.writerow(header)
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            session_id,
+            customer_id if customer_id else "",
+            user_input,
+            ai_response,
+            ", ".join(retrieved_models) if retrieved_models else "",
+            ", ".join(matched_cars) if matched_cars else ""
+        ])
+
+def get_customer_conversations(customer_id):
+    """
+    根据 customer_id 从日志中读取对话记录（自动兼容不同列数的旧文件）
+    返回: list of dict，按时间正序排列
+    """
+    log_file = "data/user_logs.csv"
+    if not os.path.exists(log_file):
+        return []
+
+    import pandas as pd
+
+    # 先尝试正常读取（带表头）
+    try:
+        df = pd.read_csv(log_file, encoding='utf-8')
+        # 检查列数，如果只有6列，说明缺少 customer_id
+        if len(df.columns) == 6:
+            # 重命名列（假设顺序：timestamp, session_id, user_input, ai_response, retrieved_models, matched_cars）
+            df.columns = ['timestamp', 'session_id', 'user_input', 'ai_response', 'retrieved_models', 'matched_cars']
+            df['customer_id'] = ""  # 新增一列，填充空
+        elif len(df.columns) == 7:
+            # 已经是7列，确保列名正确
+            df.columns = ['timestamp', 'session_id', 'customer_id', 'user_input', 'ai_response', 'retrieved_models', 'matched_cars']
+        else:
+            # 列数异常，尝试用 header=None 重新读取
+            raise ValueError("列数不匹配，尝试重新读取")
+    except (pd.errors.ParserError, ValueError):
+        # 如果解析失败（文件没有表头或格式不对），手动指定列名
+        df = pd.read_csv(log_file, encoding='utf-8', header=None)
+        if len(df.columns) == 6:
+            df.columns = ['timestamp', 'session_id', 'user_input', 'ai_response', 'retrieved_models', 'matched_cars']
+            df['customer_id'] = ""
+        elif len(df.columns) == 7:
+            df.columns = ['timestamp', 'session_id', 'customer_id', 'user_input', 'ai_response', 'retrieved_models', 'matched_cars']
+        else:
+            return []
+
+    # 按 customer_id 过滤
+    df_filtered = df[df['customer_id'].astype(str) == str(customer_id)]
+
+    if df_filtered.empty:
+        return []
+
+    # 按时间戳排序（正序）
+    df_filtered = df_filtered.sort_values('timestamp')
+
+    conversations = []
+    for _, row in df_filtered.iterrows():
+        if pd.notna(row['user_input']) and row['user_input']:
+            conversations.append({"role": "user", "content": row['user_input']})
+        if pd.notna(row['ai_response']) and row['ai_response']:
+            conversations.append({"role": "assistant", "content": row['ai_response']})
+
+    return conversations
+def generate_response(query, results_df, texts, history_messages=None):
     if results_df is None or results_df.empty:
         return "抱歉，没有找到相关的车型信息。你可以试试问具体的车型，比如：红旗H9多少钱？"
 
@@ -174,41 +324,464 @@ def generate_response(query, results_df, texts):
         context += f"主要配置：{row['主要配置']}\n"
         context += "---\n\n"
 
+    # 构建对话消息列表
+    messages = [
+        {"role": "system", "content": """你是红旗汽车的AI销售顾问，必须严格基于提供的车型数据回答。
+        数据中既有红旗车型，也有竞品车型。
+        当用户问红旗车型时，重点介绍红旗的优势。
+        当用户问对比时，客观列出参数差异，突出红旗的性价比和配置优势。
+        如果参考数据中没有相关信息，请明确告诉用户没有该数据，不要编造。
+        回答要专业、热情、简洁。价格直接说指导价，并建议到店咨询优惠。"""}
+    ]
+
+    # 添加历史对话（只取最近 6 条，避免上下文过长）
+    if history_messages:
+        # history_messages 是 list of dict，每个 dict 有 role 和 content
+        # 只取最近 6 条（3轮对话）
+        for msg in history_messages[-6:]:
+            messages.append(msg)
+
+    # 添加当前用户问题（带参考数据）
+    messages.append({"role": "user", "content": f"用户问题：{query}\n\n参考数据：\n{context}"})
+
     try:
         response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": """你是红旗汽车的AI销售顾问，必须严格基于提供的车型数据回答。
-                数据中既有红旗车型，也有竞品车型。
-                当用户问红旗车型时，重点介绍红旗的优势。
-                当用户问对比时，客观列出参数差异，突出红旗的性价比和配置优势。
-                如果参考数据中没有相关信息，请明确告诉用户没有该数据，不要编造。
-                回答要专业、热情、简洁。价格直接说指导价，并建议到店咨询优惠。"""},
-                {"role": "user", "content": f"用户问题：{query}\n\n参考数据：\n{context}"}
-            ],
+            model="deepseek-v4-pro",  # 注意模型名称
+            messages=messages,
             stream=True
         )
         return response
     except Exception as e:
         return f"调用API失败：{str(e)}"
 
+# ==================== 销售工作台（新增） ====================
+def render_sales_dashboard():
+    """销售工作台页面"""
+    st.markdown("## 🧑‍💼 销售工作台")
 
-# ===== Streamlit UI =====
+    # 权限校验：只有销售可访问
+    if not st.session_state.user or st.session_state.user['role'] != 'sales':
+        st.warning("⚠️ 只有销售顾问才能访问此页面")
+        return
+
+    current_sales = st.session_state.user['name']
+    st.info(f"当前登录：{current_sales}")
+
+    # 获取数据
+    my_customers = crm.get_my_customers(current_sales)
+    unassigned = crm.get_unassigned_customers()
+
+    # 显示我的客户
+    st.markdown("### 👤 我的客户")
+    if my_customers:
+        for row in my_customers:
+            with st.expander(f"{row['name'] or '未命名'}（📱 {row['phone']}）"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write(f"**🚗 车型偏好**：{row['preferred_model'] or '待分析'}")
+                    st.write(f"**💰 预算范围**：{row['budget_range'] or '待分析'}")
+                with col2:
+                    st.write(f"**🎯 用车场景**：{row['purpose'] or '待分析'}")
+                    st.write(f"**📌 核心诉求**：{row['key_demands'] or '待分析'}")
+                if row['notes']:
+                    st.caption(f"📝 备注：{row['notes']}")
+
+                # ----- 新增：生成画像按钮 -----
+                if st.button(f"🧠 生成画像", key=f"analyze_{row['id']}"):
+                    with st.spinner("正在分析客户对话..."):
+                        # 直接用客户ID查询对话记录（不再用手机号）
+                        conversations = get_customer_conversations(row['id'])
+
+                        if conversations:
+                            # 2. 调用 AI 分析
+                            profile = crm.analyze_customer_from_conversations(conversations, client)
+                            if profile:
+                                # 3. 保存到数据库
+                                crm.save_profile(row['id'], profile)
+                                st.success("✅ 画像分析完成！")
+                                st.rerun()
+                            else:
+                                st.error("❌ 分析失败，请重试")
+                        else:
+                            st.warning("⚠️ 该客户暂无对话记录，请让客户先与AI聊天")
+    else:
+        st.info("暂无已认领客户")
+
+    st.markdown("---")
+
+    # 显示公海池（未分配客户）
+    st.markdown("### 📋 待分配客户")
+    if unassigned:
+        for row in unassigned:
+            col1, col2, col3 = st.columns([3, 2, 1])
+            with col1:
+                st.write(f"**{row['name'] or '未命名'}**（{row['phone']}）")
+            with col2:
+                st.caption(f"注册于 {row['registered_at'][:10]}")
+            with col3:
+                if st.button("认领", key=f"claim_{row['id']}"):
+                    if crm.assign_customer_to_sales(row['id'], current_sales):
+                        st.success(f"✅ 已认领客户 {row['phone']}")
+                        st.rerun()
+                    else:
+                        st.error("❌ 认领失败，可能已被其他销售认领")
+    else:
+        st.info("🎉 暂无未分配客户")
+
+
+# ==================== Streamlit UI ====================
 st.set_page_config(page_title="红旗汽车智能销售助手", page_icon="🚗", layout="wide")
-import uuid
-if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4())
+# ===== 自定义 CSS + JS（固化手动修改） =====
 st.markdown("""
 <style>
-    .main-header { color: #8B0000; font-size: 2.2rem; font-weight: 700; text-align: center; padding: 0.5rem 0 0.2rem 0; }
-    .sub-header { text-align: center; color: #666; font-size: 1rem; margin-bottom: 1.5rem; }
-    .stButton button { background-color: #8B0000; color: white; font-weight: 500; border-radius: 20px; padding: 0.3rem 1.2rem; border: none; }
-    .stButton button:hover { background-color: #a00000; color: white; }
+    /* ===== 1. 极光渐变背景（覆盖所有层级） ===== */
+    html, body, .stApp {
+        background: 
+        radial-gradient(ellipse at 10% 20%, #db8a8a 0%, transparent 55%),
+        radial-gradient(ellipse at 90% 80%, rgba(244, 204, 65, 0.33) 0%, transparent 45%),
+        radial-gradient(ellipse at 50% 50%, rgba(130, 180, 220, 0.15) 0%, transparent 60%),
+        linear-gradient(145deg, #ece7e2 0%, rgba(241, 207, 133, 0.26) 50%, rgba(47, 48, 38, 0.2) 100%) !important;
+    background-attachment: fixed;
+        margin: 0 !important;
+        padding: 0 !important;
+        background-color: transparent !important;
+    }
+
+    /* ===== 2. 强制干掉所有内联白色背景（包括 JS 设置的） ===== */
+    [style*="background: rgb(255, 255, 255)"],
+    [style*="background-color: rgb(255, 255, 255)"],
+    [style*="background: white"],
+    [style*="background-color: white"],
+    [style*="background:#fff"],
+    [style*="background:#FFFFFF"] {
+        background: transparent !important;
+        background-color: transparent !important;
+    }
+
+    /* ===== 3. 强制所有 Streamlit 容器透明 ===== */
+    .stAppViewContainer,
+    section[data-testid="stAppViewContainer"],
+    .stAppViewContainer > div,
+    section.main,
+    section.main > div,
+    .st-emotion-cache-1r6slb0,
+    .st-emotion-cache-18e3th9,
+    .st-emotion-cache-16idsys,
+    .st-emotion-cache-6px8kg,
+    .st-emotion-cache-1j22a0y,
+    .st-emotion-cache-scp8yw,
+    .egzxvld0 {
+        background: transparent !important;
+        box-shadow: none !important;
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+        margin-top: 0 !important;
+    }
+
+    /* ===== 4. 顶部 Header（透明，不遮挡内容） ===== */
+    header.stAppHeader,
+    .st-emotion-cache-lup3yna,
+    .stAppHeader {
+        background: transparent !important;
+        background-color: transparent !important;
+        box-shadow: none !important;
+        /* 不隐藏 header，保留部署按钮等功能 */
+    }
+
+    /* ===== 5. 主区块重置内边距 ===== */
+    .block-container {
+        padding-top: 0.2rem !important;
+        padding-bottom: 0.2rem !important;
+        max-width: 1200px !important;
+        background: transparent !important;
+    }
+
+    /* ===== 6. 顶部 Banner（渐变红色 + 避开 header） ===== */
+    .brand-banner {
+        background: linear-gradient(135deg, #8B0000 0%, #cc3344 50%, #8B0000 100%) !important;
+        padding: 2rem 2.4rem !important;
+        border-radius: 20px;
+        margin-top: 3.75rem !important;    /* 重要：避开顶部 header 高度 */
+        margin-bottom: 2rem !important;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+        min-height: 90px;
+        width: 100%;
+        box-sizing: border-box;
+    }
+    .brand-banner .logo-area {
+        display: flex;
+        align-items: center;
+        gap: 0.8rem;
+    }
+    .brand-banner .logo-icon { font-size: 2rem; }
+    .brand-banner .brand-name {
+        color: #fff;
+        font-size: 1.5rem;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+        text-shadow: 0 2px 4px rgba(0,0,0,0.2);
+    }
+    .brand-banner .brand-name span {
+        color: #ffd700;
+        font-weight: 300;
+    }
+    .brand-banner .brand-slogan {
+        color: rgba(255,255,255,0.85);
+        font-size: 0.9rem;
+        font-weight: 300;
+    }
+    .brand-banner .brand-slogan em {
+        color: #ffd700;
+        font-style: normal;
+    }
+
+    /* ===== 7. 玻璃拟态核心 ===== */
+    .glass-card {
+        background: rgba(255, 255, 255, 0.08) !important;
+        backdrop-filter: blur(48px) !important;
+        -webkit-backdrop-filter: blur(48px) !important;
+        border: 1.5px solid rgba(255, 255, 255, 0.6) !important;
+        border-radius: 24px;
+        box-shadow: 
+            0 8px 40px rgba(0, 0, 0, 0.05),
+            inset 0 1px 0 rgba(255, 255, 255, 0.8) !important;
+        padding: 1rem 1.2rem;
+        transition: all 0.3s ease;
+    }
+
+    /* ===== 8. 侧边栏 ===== */
+    section[data-testid="stSidebar"] {
+        background: rgba(255, 255, 255, 0.06) !important;
+        backdrop-filter: blur(56px) !important;
+        -webkit-backdrop-filter: blur(56px) !important;
+        border-right: 1.5px solid rgba(255, 255, 255, 0.4) !important;
+        padding: 1.2rem 0.8rem !important;
+        margin-top: 0 !important;
+    }
+    section[data-testid="stSidebar"] .sidebar-brand {
+        text-align: center;
+        padding-bottom: 0.8rem;
+        border-bottom: 1px solid rgba(255,255,255,0.2);
+        margin-bottom: 1rem;
+    }
+    section[data-testid="stSidebar"] .sidebar-brand .brand-icon {
+        font-size: 1.8rem;
+    }
+    section[data-testid="stSidebar"] .sidebar-brand .brand-text {
+        font-size: 1rem;
+        font-weight: 600;
+        color: #3a1a1a;
+        text-shadow: 0 1px 4px rgba(255,255,255,0.3);
+    }
+
+    /* ===== 9. “大家都在问” 按钮颜色优化 ===== */
+    section[data-testid="stSidebar"] .stButton > button {
+        background: rgba(255, 255, 255, 0.2) !important;
+        backdrop-filter: blur(8px) !important;
+        border: 1px solid rgba(255, 255, 255, 0.3) !important;
+        border-radius: 14px;
+        padding: 0.5rem 0.8rem !important;
+        font-size: 0.9rem !important;
+        font-weight: 500 !important;
+        color: #2c1a1a !important;
+        width: 100%;
+        text-align: left;
+        transition: all 0.2s ease;
+        box-shadow: none;
+    }
+    section[data-testid="stSidebar"] .stButton > button:hover {
+        background: rgba(255, 255, 255, 0.4) !important;
+        border-color: #7a1a1a !important;
+        color: #7a1a1a !important;
+        transform: translateX(2px);
+    }
+    section[data-testid="stSidebar"] h3 {
+        color: #4a1a1a !important;
+        font-weight: 600 !important;
+        font-size: 1.1rem !important;
+        letter-spacing: 0.3px;
+    }
+
+    /* ===== 10. 消息气泡 ===== */
+    .user-message {
+        background: rgba(144, 0, 26, 0.8) !important;
+        backdrop-filter: blur(20px) !important;
+        -webkit-backdrop-filter: blur(20px) !important;
+        color: #edb974 !important; 
+        padding: 0.8rem 1.4rem;
+        border-radius: 24px 24px 6px 24px;
+        max-width: 75%;
+        margin-left: auto;
+        box-shadow: 0 4px 24px rgba(122, 26, 26, 0.15);
+        border: 1px solid rgba(255, 255, 255, 0.25) !important;
+        font-size: 0.95rem;
+        line-height: 1.6;
+        animation: slideInRight 0.25s ease;
+    }
+    .assistant-message {
+        background: rgba(255, 255, 255, 0.08) !important;
+        backdrop-filter: blur(32px) !important;
+        -webkit-backdrop-filter: blur(32px) !important;
+        color: #1a1a1a;
+        padding: 0.8rem 1.4rem;
+        border-radius: 24px 24px 24px 6px;
+        max-width: 75%;
+        box-shadow: 0 4px 32px rgba(0, 0, 0, 0.03);
+        border: 1.5px solid rgba(255, 255, 255, 0.5) !important;
+        font-size: 0.95rem;
+        line-height: 1.7;
+        animation: slideInLeft 0.25s ease;
+    }
+
+    @keyframes slideInRight {
+        from { opacity: 0; transform: translateX(16px); }
+        to { opacity: 1; transform: translateX(0); }
+    }
+    @keyframes slideInLeft {
+        from { opacity: 0; transform: translateX(-16px); }
+        to { opacity: 1; transform: translateX(0); }
+    }
+
+
+    .stChatInput > div {
+        background: rgba(255, 255, 255, 0.15) !important;
+        backdrop-filter: blur(20px) !important;
+        -webkit-backdrop-filter: blur(20px) !important;
+        border: 1px solid rgba(255, 255, 255, 0.35) !important;
+        border-radius: 40px !important;
+        padding: 0.2rem 0.4rem !important;
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.02);
+    }
+    .stChatInput > div:focus-within {
+        border-color: #7a1a1a !important;
+        background: rgba(255, 255, 255, 0.3) !important;
+        box-shadow: 0 0 0 4px rgba(122, 26, 26, 0.06);
+    }
+    .stChatInput input {
+        padding: 0.6rem 1.2rem !important;
+        font-size: 0.95rem !important;
+    }
+
+    /* ===== 12. 其他组件 ===== */
+    .stButton > button {
+        background: #7a1a1a !important;
+        color: white !important;
+        border: none !important;
+        border-radius: 30px !important;
+        padding: 0.3rem 1.6rem !important;
+        font-weight: 500 !important;
+        transition: all 0.2s ease !important;
+    }
+    .stButton > button:hover {
+        background: #4a0e0e !important;
+        transform: scale(1.02) !important;
+        box-shadow: 0 4px 12px rgba(122, 26, 26, 0.2) !important;
+    }
+
+    .stExpander {
+        background: transparent !important;
+        border: none !important;
+    }
+    .stExpander .streamlit-expanderHeader {
+        background: rgba(255,255,255,0.1) !important;
+        border-radius: 12px !important;
+        padding: 0.2rem 0.8rem !important;
+        color: #444 !important;
+    }
+    
+    /* 强制隐藏密码框内部所有按钮 */
+    .stTextInput div button {
+        display: none !important;
+    }
+    
+    /* 隐藏密码框右侧的切换按钮容器 */
+    .stTextInput .st-emotion-cache-1kyxreq {
+       display: none !important;
+    }
+
+
+
+    /* ===== 14. 响应式 ===== */
+    @media (max-width: 768px) {
+        .brand-banner {
+            flex-direction: column;
+            text-align: center;
+            padding: 1.2rem !important;
+            margin-top: 3.5rem !important;  /* 移动端 header 高度可能不同 */
+        }
+        .brand-banner .brand-slogan {
+            margin-top: 0.3rem;
+        }
+        .user-message, .assistant-message {
+            max-width: 90%;
+        }
+    }
+
+    div[data-testid="stBottom"],
+div[data-testid="stBottom"] > div,
+div[data-testid="stBottom"] * {
+    background: transparent !important;
+    background-color: transparent !important;
+}/* ===== 覆盖 st.chat_message 默认样式，使其与自定义样式一致 ===== */
+/* 用户消息（发送瞬间） */
+[data-testid="chatMessage"] {
+    background: transparent !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+}
+/* 用户消息：覆盖内部容器 */
+[data-testid="chatMessage"][data-role="user"] .st-emotion-cache-1kyxreq,
+[data-testid="chatMessage"][data-role="user"] .st-emotion-cache-1w3d5e1 {
+    background: rgba(144, 0, 32, 0.8) !important;
+    color: #edb974 !important;
+    border-radius: 24px 24px 6px 24px !important;
+    padding: 0.8rem 1.4rem !important;
+    border: 1px solid rgba(255, 255, 255, 0.25) !important;
+    box-shadow: 0 4px 24px rgba(122, 26, 26, 0.15) !important;
+}
+/* AI消息：覆盖内部容器 */
+[data-testid="chatMessage"][data-role="assistant"] .st-emotion-cache-1kyxreq,
+[data-testid="chatMessage"][data-role="assistant"] .st-emotion-cache-1w3d5e1 {
+    background: rgba(255, 255, 255, 0.08) !important;
+    backdrop-filter: blur(32px) !important;
+    -webkit-backdrop-filter: blur(32px) !important;
+    color: #1a1a1a !important;
+    border-radius: 24px 24px 24px 6px !important;
+    padding: 0.8rem 1.4rem !important;
+    border: 1.5px solid rgba(255, 255, 255, 0.5) !important;
+    box-shadow: 0 4px 32px rgba(0, 0, 0, 0.03) !important;
+}
+/* 去掉默认头像的干扰 */
+[data-testid="chatMessage"] .st-emotion-cache-1w3d5e1 img,
+[data-testid="chatMessage"] .st-emotion-cache-1w3d5e1 svg {
+    display: none !important;
+}
+[data-testid="chatMessage"] .st-emotion-cache-1kyxreq {
+    gap: 0 !important;
+}
+
+/* ===== 隐藏 Streamlit 默认密码框的眼睛图标 ===== */
+/* 方法1：通用隐藏 */
+.stTextInput button {
+    display: none !important;
+}
+
+/* 方法2：精准定位（如果方法1不生效） */
+div[data-testid="stTextInput"] button {
+    display: none !important;
+}
+
+/* 方法3：隐藏整个按钮容器 */
+.stTextInput .st-emotion-cache-1kyxreq {
+    display: none !important;
+}
 </style>
 """, unsafe_allow_html=True)
-
-st.markdown('<div class="main-header">🚗 红旗汽车智能销售助手</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">基于向量检索技术，准确理解你的需求，从车型知识库中找到最相关的信息</div>', unsafe_allow_html=True)
 
 # ===== 加载数据 =====
 df = load_car_data()
@@ -220,156 +793,279 @@ texts = build_texts(df)
 vectorizer, vectors, _ = build_vector_index(df)
 bm25 = build_bm25_index(df, texts)
 
-# ===== 初始化热门问题管理器 =====
+# ===== 初始化热门问题管理器（注入向量化器） =====
 hot_mgr = HotQuestionsManager()
+hot_mgr.set_vectorizer(vectorizer)
+
+st.markdown("""
+<div class="brand-banner">
+    <div class="logo-area">
+        <div class="logo-icon">🚗</div>
+        <div class="brand-name">红旗<span>汽车</span></div>
+    </div>
+    <div class="brand-slogan">让理想飞扬 · <em>AI 智能选车顾问</em></div>
+</div>
+""", unsafe_allow_html=True)
 
 # ===== 侧边栏 =====
+# ===== 侧边栏 =====
 with st.sidebar:
-    st.markdown("### 📊 系统状态")
-    hongqi_count = len(df[df['品牌'] == '红旗']) if '品牌' in df.columns else len(df)
-    st.success(f"✅ 已加载 {len(df)} 款车型（红旗 {hongqi_count} 款 + 竞品 {len(df) - hongqi_count} 款）")
-    st.info("🧠 向量引擎就绪（TF-IDF + BM25）")
+    # ----- 登录/注册模块（无 form，交互实时响应） -----
+    if 'user' not in st.session_state:
+        st.session_state.user = None
+
+    # 已登录状态
+    if st.session_state.user is not None:
+        user = st.session_state.user
+        if user['role'] == 'customer':
+            st.write(f"👤 **{user['name']}**（客户）")
+        else:
+            st.write(f"👤 **{user['name']}**（销售顾问）")
+
+        # 员工专属入口
+        if user['role'] == 'sales':
+            if st.button("📋 销售工作台", key="goto_sales_dashboard", use_container_width=True):
+                st.session_state.show_sales_dashboard = True
+                st.rerun()
+
+        if st.button("🚪 退出登录", key="logout_btn", use_container_width=True):
+            st.session_state.user = None
+            st.session_state.show_sales_dashboard = False
+            st.rerun()
+        st.markdown("---")
+    else:
+        # 未登录：显示登录/注册弹窗
+        with st.popover("🔑 登录 / 注册", use_container_width=True):
+            # 定义两个 Tab
+            tab_login, tab_register = st.tabs(["🔑 登录", "📝 注册"])
+
+            with tab_login:
+                # 不用 st.form，直接放组件
+                role_login = st.radio("角色", ["客户", "员工"], key="login_role", horizontal=True)
+                phone_login = st.text_input("手机号", key="login_phone_modal")
+                # 复选框控制密码是否明文显示（勾选后立即 rerun，生效）
+                show_pwd_login = st.checkbox("显示密码", key="show_pwd_login")
+                if show_pwd_login:
+                    password_login = st.text_input("密码（明文）", key="login_password_modal")
+                else:
+                    password_login = st.text_input("密码", type="password", key="login_password_modal")
+                # 登录按钮（普通按钮，点击后执行逻辑）
+                if st.button("登录", key="login_btn_modal"):
+                    if role_login == "客户":
+                        user = crm.login_customer(phone_login, password_login)
+                        if user:
+                            st.session_state.user = user
+                            st.success("登录成功！")
+                            st.rerun()
+                        else:
+                            st.error("手机号或密码错误")
+                    else:
+                        user = crm.login_sales_rep(phone_login, password_login)
+                        if user:
+                            st.session_state.user = user
+                            st.success("登录成功！")
+                            st.rerun()
+                        else:
+                            st.error("手机号或密码错误")
+
+            with tab_register:
+                role_reg = st.radio("注册角色", ["客户", "员工"], key="reg_role_modal", horizontal=True)
+                phone_reg = st.text_input("手机号", key="reg_phone_modal")
+                name_reg = st.text_input("姓名", key="reg_name_modal")
+                show_pwd_reg = st.checkbox("显示密码", key="show_pwd_reg")
+                if show_pwd_reg:
+                    password_reg = st.text_input("密码（明文）", key="reg_password_modal")
+                    confirm_reg = st.text_input("确认密码（明文）", key="reg_confirm_modal")
+                else:
+                    password_reg = st.text_input("密码", type="password", key="reg_password_modal")
+                    confirm_reg = st.text_input("确认密码", type="password", key="reg_confirm_modal")
+                if st.button("注册", key="reg_btn_modal"):
+                    if password_reg != confirm_reg:
+                        st.error("两次密码不一致")
+                    elif len(phone_reg) < 11:
+                        st.error("请输入有效的手机号")
+                    else:
+                        if role_reg == "客户":
+                            result = crm.register_customer(phone_reg, name_reg, password_reg)
+                            if result:
+                                st.session_state.user = result
+                                st.success("注册成功，已自动登录！")
+                                st.rerun()
+                            else:
+                                st.error("手机号已被注册")
+                        else:
+                            result = crm.register_sales_rep(phone_reg, name_reg, password_reg)
+                            if result:
+                                st.session_state.user = result
+                                st.success("注册成功，已自动登录！")
+                                st.rerun()
+                            else:
+                                st.error("手机号或姓名已被注册")
+        st.markdown("---")
+
+    # ----- 原有的侧边栏内容（系统状态、热门问题等）-----
+    st.markdown("""
+    <div class="sidebar-brand">
+        <div class="brand-icon">🚗</div>
+        <div class="brand-text">红旗 · AI 助手</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    with st.expander("📊 系统状态", expanded=True):
+        hongqi_count = len(df[df['品牌'] == '红旗']) if '品牌' in df.columns else len(df)
+        st.success(f"✅ 已加载 {len(df)} 款车型（红旗 {hongqi_count} 款）")
+        st.info("🧠 引擎: TF-IDF + BM25")
 
     st.markdown("---")
-    st.markdown("### 🔥 热门问题")
-    st.markdown("点击即可快速提问：")
+    st.markdown("### 🔥 大家都在问")
 
     top_questions = hot_mgr.get_top_questions(5)
+    if len(top_questions) < 3:
+        defaults = ["红旗H9多少钱", "哪款车适合二胎家庭", "红旗H9和奥迪A6L哪个好"]
+        for q in defaults:
+            if q not in top_questions:
+                top_questions.append(q)
+        top_questions = top_questions[:5]
 
-    seen_questions = set()
-    deduplicated = []
+    for q in top_questions:
+        if st.button(f"{q}", key=f"hot_{q}"):
+            st.session_state.quick_question = q
 
-    for q_label in top_questions:
-        q_text = re.sub(r"（热度：\d+）", "", q_label).strip()
-        if q_text not in seen_questions:
-            seen_questions.add(q_text)
-            deduplicated.append(q_label)
-
-    if len(deduplicated) < 3:
-        default_questions = [
-            "红旗H9多少钱",
-            "哪款车适合二胎家庭",
-            "红旗H9和奥迪A6L哪个好"
-        ]
-        for q in default_questions:
-            if q not in seen_questions:
-                seen_questions.add(q)
-                deduplicated.append(f"{q}（热度：0）")
-            if len(deduplicated) >= 5:
-                break
-
-    for idx, q_label in enumerate(deduplicated[:5]):
-        q_text = re.sub(r"（热度：\d+）", "", q_label).strip()
-        if st.button(q_label, key=f"hot_{q_text}_{idx}", use_container_width=True):
-            st.session_state.quick_question = q_text
+    st.markdown("---")
+    with st.expander("💡 使用提示", expanded=False):
+        st.markdown("""
+        - 输入车型名称查询详细参数
+        - 问 **最贵/最便宜** 进行价格排序
+        - 输入两个车型（如 **H9 vs H5**）进行对比
+        """)
 
 # ===== 初始化 session_state =====
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "你好！我是红旗汽车的AI销售顾问，请问有什么可以帮你？"}
+        {"role": "assistant", "content": "你好，我是红旗 AI 销售顾问。请问你想了解哪款红旗车型？"}
     ]
 if "quick_question" not in st.session_state:
     st.session_state.quick_question = None
 if "pending_question" not in st.session_state:
     st.session_state.pending_question = None
+if "last_results" not in st.session_state:
+    st.session_state.last_results = None
+# ===== 新增：销售工作台开关 =====
+if "show_sales_dashboard" not in st.session_state:
+    st.session_state.show_sales_dashboard = False
 
 # ===== 处理热门问题点击 =====
 if st.session_state.get("quick_question"):
     st.session_state.pending_question = st.session_state.quick_question
     st.session_state.quick_question = None
 
-# ===== 显示聊天记录 =====
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-
-        # ===添加记录函数
-        def log_user_interaction(session_id, user_input, ai_response, retrieved_models, matched_cars):
-            """将用户交互记录追加到 CSV"""
-            log_file = "data/user_logs.csv"
-            file_exists = os.path.exists(log_file)
-
-            with open(log_file, mode='a', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                # 如果文件不存在，先写入表头
-                if not file_exists:
-                    writer.writerow(
-                        ["timestamp", "session_id", "user_input", "ai_response", "retrieved_models", "matched_cars"])
-                writer.writerow([
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    session_id,
-                    user_input,
-                    ai_response,
-                    ", ".join(retrieved_models) if retrieved_models else "",
-                    ", ".join(matched_cars) if matched_cars else ""
-                ])
-# ===== 用户输入 =====
-if st.session_state.get("pending_question"):
-    user_input = st.session_state.pending_question
-    st.session_state.pending_question = None
+# ===== 页面路由 =====
+if st.session_state.get("show_sales_dashboard", False):
+    # ----- 销售工作台页面 -----
+    render_sales_dashboard()
+    # 返回按钮
+    if st.button("← 返回智能选车", key="back_to_chat"):
+        st.session_state.show_sales_dashboard = False
+        st.rerun()
 else:
-    user_input = st.chat_input("请输入你关心的问题...")
+    # ===== 智能选车聊天界面 =====
+    chat_container = st.container()
+    with chat_container:
+        for msg in st.session_state.messages:
+            if msg["role"] == "user":
+                st.markdown(
+                    f'<div style="display: flex; justify-content: flex-end; margin: 0.6rem 0;"><div class="user-message">{msg["content"]}</div></div>',
+                    unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    f'<div style="display: flex; justify-content: flex-start; margin: 0.6rem 0;"><div class="assistant-message">{msg["content"]}</div></div>',
+                    unsafe_allow_html=True)
 
-if user_input:
-    # 记录热门问题
-    hot_mgr.record_question(user_input)
+    # 输入框：先定义 user_input = None，确保变量始终存在
+    user_input = None
 
-    # 显示用户消息
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.markdown(user_input)
-
-    # 检索
-    results_df, _ = search_car(user_input, vectorizer, vectors, bm25, df, texts)
-
-    # 生成回答
-    response_stream = generate_response(user_input, results_df, texts)
-
-    # 获取检索到的车型列表（用于日志）
-    retrieved_models = results_df['车型'].tolist() if not results_df.empty else []
-
-    # 提取匹配到的车型关键词（从 search_car 的逻辑中复用）
-    car_keywords = ['h9', 'h5', 'hs5', 'hs7', 'h6', 'eqm5', 'ehs9', 'hs3', 'hq9']
-    query_lower = user_input.lower()
-    matched_cars = [kw for kw in car_keywords if kw in query_lower]
-
-    # 处理流式响应
-    if hasattr(response_stream, '__iter__') and not isinstance(response_stream, str):
-        with st.chat_message("assistant"):
-            full_response = st.write_stream(response_stream)
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
+    if st.session_state.get("pending_question"):
+        user_input = st.session_state.pending_question
+        st.session_state.pending_question = None
     else:
-        full_response = response_stream
-        with st.chat_message("assistant"):
-            st.markdown(full_response)
+        user_input = st.chat_input("💬 请输入你关心的问题...")
+
+    # 只有在 user_input 有内容时才处理
+    if user_input is not None and user_input != "":
+        # 记录问题
+        hot_mgr.record_question(user_input, client=client)
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        st.markdown(
+            f'<div style="display: flex; justify-content: flex-end; margin: 0.6rem 0;"><div class="user-message">{user_input}</div></div>',
+            unsafe_allow_html=True
+        )
+
+        # ----- 检索（带加载动画） -----
+        with st.spinner("🔍 正在检索车型..."):
+            results_df, _, matched_cars = search_car(user_input, vectorizer, vectors, bm25, df, texts)
+        st.session_state.last_results = results_df
+
+        # ----- 生成回答（流式） -----
+        response_stream = generate_response(
+            user_input,
+            results_df,
+            texts,
+            history_messages=st.session_state.messages
+        )
+
+        # 占位符用于流式输出，初始显示加载提示
+        placeholder = st.empty()
+        placeholder.markdown("🤔 正在生成回答...")
+
+        full_response = ""
+        first_chunk = True
+
+        if hasattr(response_stream, '__iter__') and not isinstance(response_stream, str):
+            for chunk in response_stream:
+                if hasattr(chunk, 'choices') and chunk.choices:
+                    delta = chunk.choices[0].delta
+                    if hasattr(delta, 'content') and delta.content:
+                        if first_chunk:
+                            placeholder.empty()
+                            first_chunk = False
+                        full_response += delta.content
+                        placeholder.markdown(
+                            f'<div style="display: flex; justify-content: flex-start; margin: 0.6rem 0;"><div class="assistant-message">{full_response}</div></div>',
+                            unsafe_allow_html=True
+                        )
+                else:
+                    if first_chunk:
+                        placeholder.empty()
+                        first_chunk = False
+                    full_response += str(chunk)
+                    placeholder.markdown(
+                        f'<div style="display: flex; justify-content: flex-start; margin: 0.6rem 0;"><div class="assistant-message">{full_response}</div></div>',
+                        unsafe_allow_html=True
+                    )
+        else:
+            full_response = response_stream
+            placeholder.markdown(
+                f'<div style="display: flex; justify-content: flex-start; margin: 0.6rem 0;"><div class="assistant-message">{full_response}</div></div>',
+                unsafe_allow_html=True
+            )
+
+        # 保存完整回答
         st.session_state.messages.append({"role": "assistant", "content": full_response})
 
-    # ===== 记录用户交互日志（CSV） =====
-    def log_user_interaction(session_id, user_input, ai_response, retrieved_models, matched_cars):
-        """将用户交互记录追加到 CSV"""
-        log_file = "data/user_logs.csv"
-        file_exists = os.path.exists(log_file)
+        # 记录日志
+        retrieved_models = results_df['车型'].tolist() if not results_df.empty else []
+        customer_id = None
+        if st.session_state.user and st.session_state.user['role'] == 'customer':
+            customer_id = st.session_state.user.get('id')
+        log_user_interaction(
+            session_id=st.session_state.get("session_id", "unknown"),
+            customer_id=customer_id,
+            user_input=user_input,
+            ai_response=full_response,
+            retrieved_models=retrieved_models,
+            matched_cars=matched_cars
+        )
 
-        with open(log_file, mode='a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(["timestamp", "session_id", "user_input", "ai_response", "retrieved_models", "matched_cars"])
-            writer.writerow([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                session_id,
-                user_input,
-                ai_response,
-                ", ".join(retrieved_models) if retrieved_models else "",
-                ", ".join(matched_cars) if matched_cars else ""
-            ])
-
-    log_user_interaction(
-        session_id=st.session_state.get("session_id", "unknown"),
-        user_input=user_input,
-        ai_response=full_response,
-        retrieved_models=retrieved_models,
-        matched_cars=matched_cars
-    )
-
-    st.rerun()
+        st.rerun()
