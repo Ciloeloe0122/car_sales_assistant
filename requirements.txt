@@ -5,3 +5,4 @@ scikit-learn
 rank_bm25
 jieba
 python-dotenv
+markdown
