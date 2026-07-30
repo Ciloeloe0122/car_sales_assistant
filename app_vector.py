@@ -19,6 +19,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from rank_bm25 import BM25Okapi
 from openai import OpenAI
 from dotenv import load_dotenv
+import markdown
 
 load_dotenv()
 
@@ -40,7 +41,7 @@ client = OpenAI(
 
 # ==================== 语义聚合版热门问题管理器 ====================
 class HotQuestionsManager:
-    def __init__(self, storage_file="data/hot_questions.json", similarity_threshold=0.6):
+    def __init__(self, storage_file="data/hot_questions.json", similarity_threshold=0.45):
         self.storage_file = storage_file
         self.similarity_threshold = similarity_threshold
         self.data = self._load()
@@ -121,6 +122,9 @@ class HotQuestionsManager:
 # ==================== 数据加载与索引构建 ====================
 @st.cache_data
 def load_car_data():
+    import csv
+
+    # 读取红旗数据（用 pandas 读，因为格式相对规范）
     try:
         df_hongqi = pd.read_csv("data/hongqi_data.csv", encoding="utf-8", dtype={"长*宽*高(mm)": str})
         df_hongqi["品牌"] = "红旗"
@@ -128,17 +132,45 @@ def load_car_data():
         st.error(f"读取红旗数据失败：{e}")
         return None
 
+    # 读取竞品数据（用原生 csv 模块，更健壮）
     try:
-        df_competitor = pd.read_csv("data/competitor_data.csv", encoding="utf-8", dtype={"长*宽*高(mm)": str})
-        df_competitor["品牌"] = df_competitor.get("品牌", "竞品")
+        rows = []
+        with open("data/competitor_data.csv", "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader)  # 跳过表头
+
+            # 清理表头中的空格
+            header = [col.strip() for col in header]
+
+            for row in reader:
+                # 如果这一行的列数少于表头，跳过
+                if len(row) < len(header):
+                    continue
+                # 如果列数多于表头，尝试合并多余的列到最后一列
+                if len(row) > len(header):
+                    # 把多余的列合并到主要配置列（索引 13）
+                    extra = row[13:]
+                    row = row[:13] + ["，".join(extra)] + row[14:]
+                # 确保列数一致
+                if len(row) >= len(header):
+                    rows.append(row[:len(header)])
+
+        # 构建 DataFrame
+        df_competitor = pd.DataFrame(rows, columns=header)
+        if "品牌" not in df_competitor.columns:
+            df_competitor["品牌"] = "竞品"
+
     except Exception as e:
-        st.warning(f"竞品数据未找到，只使用红旗数据：{e}")
+        st.warning(f"竞品数据加载失败，只使用红旗数据：{e}")
         df_competitor = pd.DataFrame()
 
-    df = pd.concat([df_hongqi, df_competitor], ignore_index=True)
+    # 合并数据
+    if not df_competitor.empty:
+        df = pd.concat([df_hongqi, df_competitor], ignore_index=True)
+    else:
+        df = df_hongqi
     df = df.fillna("")
     return df
-
 
 def build_texts(df):
     texts = []
@@ -255,59 +287,91 @@ def log_user_interaction(session_id, customer_id, user_input, ai_response, retri
             ", ".join(matched_cars) if matched_cars else ""
         ])
 
+
 def get_customer_conversations(customer_id):
     """
-    根据 customer_id 从日志中读取对话记录（自动兼容不同列数的旧文件）
+    根据 customer_id 从日志中读取对话记录
     返回: list of dict，按时间正序排列
     """
+    import csv
     log_file = "data/user_logs.csv"
     if not os.path.exists(log_file):
         return []
 
-    import pandas as pd
+    conversations = []
+    target_id = str(customer_id).strip()
 
-    # 先尝试正常读取（带表头）
     try:
-        df = pd.read_csv(log_file, encoding='utf-8')
-        # 检查列数，如果只有6列，说明缺少 customer_id
-        if len(df.columns) == 6:
-            # 重命名列（假设顺序：timestamp, session_id, user_input, ai_response, retrieved_models, matched_cars）
-            df.columns = ['timestamp', 'session_id', 'user_input', 'ai_response', 'retrieved_models', 'matched_cars']
-            df['customer_id'] = ""  # 新增一列，填充空
-        elif len(df.columns) == 7:
-            # 已经是7列，确保列名正确
-            df.columns = ['timestamp', 'session_id', 'customer_id', 'user_input', 'ai_response', 'retrieved_models', 'matched_cars']
-        else:
-            # 列数异常，尝试用 header=None 重新读取
-            raise ValueError("列数不匹配，尝试重新读取")
-    except (pd.errors.ParserError, ValueError):
-        # 如果解析失败（文件没有表头或格式不对），手动指定列名
-        df = pd.read_csv(log_file, encoding='utf-8', header=None)
-        if len(df.columns) == 6:
-            df.columns = ['timestamp', 'session_id', 'user_input', 'ai_response', 'retrieved_models', 'matched_cars']
-            df['customer_id'] = ""
-        elif len(df.columns) == 7:
-            df.columns = ['timestamp', 'session_id', 'customer_id', 'user_input', 'ai_response', 'retrieved_models', 'matched_cars']
-        else:
+        with open(log_file, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+
+        if len(rows) < 2:
             return []
 
-    # 按 customer_id 过滤
-    df_filtered = df[df['customer_id'].astype(str) == str(customer_id)]
+        # 解析表头
+        header = rows[0]
+        # 尝试找到各列索引（忽略大小写和空格）
+        col_map = {}
+        for idx, col_name in enumerate(header):
+            col_clean = col_name.strip().lower()
+            if 'timestamp' in col_clean:
+                col_map['timestamp'] = idx
+            elif 'session' in col_clean and 'id' in col_clean:
+                col_map['session_id'] = idx
+            elif 'customer' in col_clean and 'id' in col_clean:
+                col_map['customer_id'] = idx
+            elif 'user' in col_clean and 'input' in col_clean:
+                col_map['user_input'] = idx
+            elif 'ai' in col_clean and 'response' in col_clean:
+                col_map['ai_response'] = idx
+            elif 'retrieved' in col_clean:
+                col_map['retrieved_models'] = idx
+            elif 'matched' in col_clean:
+                col_map['matched_cars'] = idx
 
-    if df_filtered.empty:
+        # 检查必要列是否存在
+        if 'customer_id' not in col_map or 'user_input' not in col_map:
+            # 如果找不到，尝试按位置推断（常见的列顺序）
+            # timestamp, session_id, customer_id, user_input, ai_response, retrieved_models, matched_cars
+            if len(header) >= 7:
+                col_map['timestamp'] = 0
+                col_map['session_id'] = 1
+                col_map['customer_id'] = 2
+                col_map['user_input'] = 3
+                col_map['ai_response'] = 4
+                col_map['retrieved_models'] = 5
+                col_map['matched_cars'] = 6
+            else:
+                return []
+
+        # 获取各列索引
+        cust_idx = col_map['customer_id']
+        user_idx = col_map['user_input']
+        ai_idx = col_map.get('ai_response', user_idx + 1)  # 如果没找到，假设在 user_input 后面
+
+        # 遍历数据行
+        for row in rows[1:]:
+            if len(row) <= max(cust_idx, user_idx, ai_idx):
+                continue
+            # 去掉可能的前后空格后再比较
+            cust_val = row[cust_idx].strip()
+            if cust_val == target_id:
+                user_content = row[user_idx].strip() if len(row) > user_idx else ""
+                ai_content = row[ai_idx].strip() if len(row) > ai_idx else ""
+                if user_content:
+                    conversations.append({"role": "user", "content": user_content})
+                if ai_content:
+                    conversations.append({"role": "assistant", "content": ai_content})
+
+        return conversations
+
+    except Exception as e:
+        # 如果出错，打印错误并返回空列表
+        print(f"读取日志文件出错: {e}")
         return []
 
-    # 按时间戳排序（正序）
-    df_filtered = df_filtered.sort_values('timestamp')
 
-    conversations = []
-    for _, row in df_filtered.iterrows():
-        if pd.notna(row['user_input']) and row['user_input']:
-            conversations.append({"role": "user", "content": row['user_input']})
-        if pd.notna(row['ai_response']) and row['ai_response']:
-            conversations.append({"role": "assistant", "content": row['ai_response']})
-
-    return conversations
 def generate_response(query, results_df, texts, history_messages=None):
     if results_df is None or results_df.empty:
         return "抱歉，没有找到相关的车型信息。你可以试试问具体的车型，比如：红旗H9多少钱？"
@@ -326,12 +390,38 @@ def generate_response(query, results_df, texts, history_messages=None):
 
     # 构建对话消息列表
     messages = [
-        {"role": "system", "content": """你是红旗汽车的AI销售顾问，必须严格基于提供的车型数据回答。
-        数据中既有红旗车型，也有竞品车型。
-        当用户问红旗车型时，重点介绍红旗的优势。
-        当用户问对比时，客观列出参数差异，突出红旗的性价比和配置优势。
-        如果参考数据中没有相关信息，请明确告诉用户没有该数据，不要编造。
-        回答要专业、热情、简洁。价格直接说指导价，并建议到店咨询优惠。"""}
+        {"role": "system", "content": """
+    你是红旗汽车的AI销售顾问，具备以下核心原则和策略：
+
+    【第一原则：只推红旗】
+    - 你只推荐红旗品牌车型，绝不推荐任何竞品（如奥迪、比亚迪、丰田等）。
+    - 当用户问对比时，只提供客观参数差异（如价格、尺寸、配置），但结论必须导向红旗的优势。
+    - 严禁说"也可以考虑XX品牌"或"如果预算不够可以看XX"。
+
+    【财务问题的处理准则】
+    - 对于价格、落地价、购置税、保险、分期付款等涉及具体金额的问题，你**绝对不能编造数字**。
+    - 如果你在检索到的数据中有明确的指导价，可以直接告诉用户指导价是多少。
+    - 对于落地价（含税、保险等），必须明确告知："落地价需要到店根据当地政策和优惠核算，建议您到店详谈。"
+    - 对于分期方案（首付、月供等），必须说："分期政策因经销商而异，具体方案需要到店咨询您的金融专员。"
+    - 严禁给出任何具体的估算数字（如"月供大概3000元"、"首付约5万"），除非数据中有明确标注。
+    - 如果用户追问，统一回应："非常抱歉，金融政策实时变动，我无法提供准确数字。建议您到店，我们的金融顾问会为您做精确报价。"
+
+    【资料库缺失时的话术策略】
+    当用户问的车型不在资料库中时，按以下步骤处理：
+    1. 先如实说明："不好意思，我这边暂时没有该车型的详细参数资料。"
+    2. 然后转向推荐红旗同级别或相近价位车型："但如果您对中大型轿车感兴趣，我可以为您介绍红旗H9/H5等车型，它们在空间和配置上都非常出色。"
+    3. 结尾不要主动邀约，只留一个开放式结尾："如果您想了解更多，可以随时再问我。"或者“期待您的下一次提问。”
+
+    【结尾策略（根据对话阶段灵活选择，不要每次都用同一套）】
+    - 初次回答（用户只问了一个简单问题）：直接结束，不加邀约。例："如果您还有其他问题，随时可以问我。"
+    - 用户表现出兴趣（问了2个以上问题，或追问细节）：温和结尾。例："如果您想进一步了解，也可以到店亲自体验一下。"
+    - 用户明确有购买意向（问价格、金融方案、库存等）：可以主动邀约。例："建议您到店试驾感受一下，我可以帮您预约。"
+
+    【回答风格】
+    - 专业、热情、自然，像朋友在聊天，不要像机器人念稿。
+    - 内容要简洁，不要列大段参数。
+    - 根据问题的复杂程度决定回答长度，简单问题简短回答，复杂问题详细回答。
+    """}
     ]
 
     # 添加历史对话（只取最近 6 条，避免上下文过长）
@@ -355,6 +445,7 @@ def generate_response(query, results_df, texts, history_messages=None):
         return f"调用API失败：{str(e)}"
 
 # ==================== 销售工作台（新增） ====================
+
 def render_sales_dashboard():
     """销售工作台页面"""
     st.markdown("## 🧑‍💼 销售工作台")
@@ -383,27 +474,40 @@ def render_sales_dashboard():
                 with col2:
                     st.write(f"**🎯 用车场景**：{row['purpose'] or '待分析'}")
                     st.write(f"**📌 核心诉求**：{row['key_demands'] or '待分析'}")
-                if row['notes']:
-                    st.caption(f"📝 备注：{row['notes']}")
 
-                # ----- 新增：生成画像按钮 -----
-                if st.button(f"🧠 生成画像", key=f"analyze_{row['id']}"):
-                    with st.spinner("正在分析客户对话..."):
-                        # 直接用客户ID查询对话记录（不再用手机号）
-                        conversations = get_customer_conversations(row['id'])
+                # 显示对话回顾
+                if row.get('notes'):
+                    with st.expander("📋 查看完整对话回顾", expanded=False):
+                        st.write(row['notes'])
+                else:
+                    st.caption("📝 暂无对话回顾")
 
-                        if conversations:
-                            # 2. 调用 AI 分析
-                            profile = crm.analyze_customer_from_conversations(conversations, client)
-                            if profile:
-                                # 3. 保存到数据库
-                                crm.save_profile(row['id'], profile)
-                                st.success("✅ 画像分析完成！")
-                                st.rerun()
+                # 操作按钮（生成画像 + 移除客户）
+                col_btn1, col_btn2 = st.columns(2)
+
+                with col_btn1:
+                    if st.button(f"🧠 生成画像", key=f"analyze_{row['id']}"):
+                        with st.spinner("正在分析客户对话..."):
+                            conversations = get_customer_conversations(row['id'])
+                            if conversations:
+                                profile = crm.analyze_customer_from_conversations(conversations, client)
+                                if profile:
+                                    crm.save_profile(row['id'], profile)
+                                    st.success("✅ 画像分析完成！")
+                                    st.rerun()
+                                else:
+                                    st.error("❌ 分析失败，请重试")
                             else:
-                                st.error("❌ 分析失败，请重试")
+                                st.warning("⚠️ 该客户暂无对话记录，请让客户先与AI聊天")
+
+                # ⭐ 新增：移除客户按钮
+                with col_btn2:
+                    if st.button(f"🗑️ 移除客户", key=f"remove_{row['id']}"):
+                        if crm.release_customer(row['id']):
+                            st.warning(f"✅ 已移除客户 {row['phone']}，客户已回到公海池")
+                            st.rerun()
                         else:
-                            st.warning("⚠️ 该客户暂无对话记录，请让客户先与AI聊天")
+                            st.error("❌ 移除失败，请重试")
     else:
         st.info("暂无已认领客户")
 
@@ -427,6 +531,7 @@ def render_sales_dashboard():
                         st.error("❌ 认领失败，可能已被其他销售认领")
     else:
         st.info("🎉 暂无未分配客户")
+
 
 
 # ==================== Streamlit UI ====================
@@ -622,6 +727,7 @@ st.markdown("""
         line-height: 1.6;
         animation: slideInRight 0.25s ease;
     }
+    
     .assistant-message {
         background: rgba(255, 255, 255, 0.08) !important;
         backdrop-filter: blur(32px) !important;
@@ -635,8 +741,28 @@ st.markdown("""
         font-size: 0.95rem;
         line-height: 1.7;
         animation: slideInLeft 0.25s ease;
-    }
 
+    }
+    .assistant-message h1,
+    .assistant-message h2,
+    .assistant-message h3,
+    .assistant-message h4,
+    .assistant-message h5,
+    .assistant-message h6 {
+        font-size: 1rem !important;
+        font-weight: 600 !important;
+        margin: 0.5rem 0 !important;
+    }
+    .assistant-message ul,
+    .assistant-message ol {
+        padding-left: 1.5rem !important;
+    }
+    .assistant-message li {
+        margin-bottom: 0.2rem !important;
+    }
+    
+
+    
     @keyframes slideInRight {
         from { opacity: 0; transform: translateX(16px); }
         to { opacity: 1; transform: translateX(0); }
@@ -831,6 +957,11 @@ with st.sidebar:
         if st.button("🚪 退出登录", key="logout_btn", use_container_width=True):
             st.session_state.user = None
             st.session_state.show_sales_dashboard = False
+            # 重置聊天记录
+            st.session_state.messages = [
+                {"role": "assistant", "content": "你好，我是红旗 AI 销售顾问。请问你想了解哪款红旗车型？"}]
+            st.session_state.quick_question = None
+            st.session_state.pending_question = None
             st.rerun()
         st.markdown("---")
     else:
@@ -855,6 +986,11 @@ with st.sidebar:
                         user = crm.login_customer(phone_login, password_login)
                         if user:
                             st.session_state.user = user
+                            # 重置聊天记录
+                            st.session_state.messages = [
+                                {"role": "assistant", "content": "你好，我是红旗 AI 销售顾问。请问你想了解哪款红旗车型？"}]
+                            st.session_state.quick_question = None
+                            st.session_state.pending_question = None
                             st.success("登录成功！")
                             st.rerun()
                         else:
@@ -863,6 +999,11 @@ with st.sidebar:
                         user = crm.login_sales_rep(phone_login, password_login)
                         if user:
                             st.session_state.user = user
+                            # ⭐ 新增：重置聊天记录
+                            st.session_state.messages = [
+                                {"role": "assistant", "content": "你好，我是红旗 AI 销售顾问。请问你想了解哪款红旗车型？"}]
+                            st.session_state.quick_question = None
+                            st.session_state.pending_question = None
                             st.success("登录成功！")
                             st.rerun()
                         else:
@@ -889,6 +1030,10 @@ with st.sidebar:
                             result = crm.register_customer(phone_reg, name_reg, password_reg)
                             if result:
                                 st.session_state.user = result
+                                st.session_state.messages = [{"role": "assistant",
+                                                              "content": "你好，我是红旗 AI 销售顾问。请问你想了解哪款红旗车型？"}]
+                                st.session_state.quick_question = None
+                                st.session_state.pending_question = None
                                 st.success("注册成功，已自动登录！")
                                 st.rerun()
                             else:
@@ -897,6 +1042,11 @@ with st.sidebar:
                             result = crm.register_sales_rep(phone_reg, name_reg, password_reg)
                             if result:
                                 st.session_state.user = result
+                                # ⭐ 新增：重置聊天记录
+                                t.session_state.messages = [{"role": "assistant",
+                                                             "content": "你好，我是红旗 AI 销售顾问。请问你想了解哪款红旗车型？"}]
+                                st.session_state.quick_question = None
+                                st.session_state.pending_question = None
                                 st.success("注册成功，已自动登录！")
                                 st.rerun()
                             else:
@@ -979,10 +1129,10 @@ else:
                     f'<div style="display: flex; justify-content: flex-end; margin: 0.6rem 0;"><div class="user-message">{msg["content"]}</div></div>',
                     unsafe_allow_html=True)
             else:
+                html_content = markdown.markdown(msg["content"])
                 st.markdown(
-                    f'<div style="display: flex; justify-content: flex-start; margin: 0.6rem 0;"><div class="assistant-message">{msg["content"]}</div></div>',
+                    f'<div style="display: flex; justify-content: flex-start; margin: 0.6rem 0;"><div class="assistant-message">{html_content}</div></div>',
                     unsafe_allow_html=True)
-
     # 输入框：先定义 user_input = None，确保变量始终存在
     user_input = None
 
@@ -994,6 +1144,7 @@ else:
 
     # 只有在 user_input 有内容时才处理
     if user_input is not None and user_input != "":
+
         # 记录问题
         hot_mgr.record_question(user_input, client=client)
         st.session_state.messages.append({"role": "user", "content": user_input})
@@ -1007,6 +1158,7 @@ else:
             results_df, _, matched_cars = search_car(user_input, vectorizer, vectors, bm25, df, texts)
         st.session_state.last_results = results_df
 
+
         # ----- 生成回答（流式） -----
         response_stream = generate_response(
             user_input,
@@ -1015,9 +1167,27 @@ else:
             history_messages=st.session_state.messages
         )
 
-        # 占位符用于流式输出，初始显示加载提示
+        #加载动画： 占位符用于流式输出，初始显示加载提示（带转圈动画）
         placeholder = st.empty()
-        placeholder.markdown("🤔 正在生成回答...")
+        placeholder.markdown(
+            """
+            <div style="display: flex; align-items: center; gap: 12px; margin: 0.6rem 0;">
+                <svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                    <style>
+                        @keyframes spin {
+                            0% { transform: rotate(0deg); }
+                            100% { transform: rotate(360deg); }
+                        }
+                        .spinner { animation: spin 1s linear infinite; transform-origin: center; }
+                    </style>
+                    <circle cx="12" cy="12" r="10" fill="none" stroke="#8B0000" stroke-width="3" opacity="0.2"/>
+                    <path class="spinner" d="M12 2 A10 10 0 0 1 22 12" fill="none" stroke="#8B0000" stroke-width="3" stroke-linecap="round"/>
+                </svg>
+                <span style="font-size: 1rem; color: #555;">正在生成回答...</span>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
         full_response = ""
         first_chunk = True
@@ -1028,33 +1198,39 @@ else:
                     delta = chunk.choices[0].delta
                     if hasattr(delta, 'content') and delta.content:
                         if first_chunk:
+                            # 第一次收到内容，清空加载提示
                             placeholder.empty()
                             first_chunk = False
                         full_response += delta.content
+                        # 每收到一块内容，用 markdown 转换后刷新显示
+                        html_content = markdown.markdown(full_response)
                         placeholder.markdown(
-                            f'<div style="display: flex; justify-content: flex-start; margin: 0.6rem 0;"><div class="assistant-message">{full_response}</div></div>',
+                            f'<div style="display: flex; justify-content: flex-start; margin: 0.6rem 0;"><div class="assistant-message">{html_content}</div></div>',
                             unsafe_allow_html=True
                         )
                 else:
+                    # 异常情况兼容
                     if first_chunk:
                         placeholder.empty()
                         first_chunk = False
                     full_response += str(chunk)
+                    html_content = markdown.markdown(full_response)
                     placeholder.markdown(
-                        f'<div style="display: flex; justify-content: flex-start; margin: 0.6rem 0;"><div class="assistant-message">{full_response}</div></div>',
+                        f'<div style="display: flex; justify-content: flex-start; margin: 0.6rem 0;"><div class="assistant-message">{html_content}</div></div>',
                         unsafe_allow_html=True
                     )
         else:
+            # 非流式响应
             full_response = response_stream
+            html_content = markdown.markdown(full_response)
             placeholder.markdown(
-                f'<div style="display: flex; justify-content: flex-start; margin: 0.6rem 0;"><div class="assistant-message">{full_response}</div></div>',
+                f'<div style="display: flex; justify-content: flex-start; margin: 0.6rem 0;"><div class="assistant-message">{html_content}</div></div>',
                 unsafe_allow_html=True
             )
 
-        # 保存完整回答
+        # 保存完整回答（存入 session_state 时不转换，保留原始 Markdown）
         st.session_state.messages.append({"role": "assistant", "content": full_response})
-
-        # 记录日志
+        # 7. 记录日志
         retrieved_models = results_df['车型'].tolist() if not results_df.empty else []
         customer_id = None
         if st.session_state.user and st.session_state.user['role'] == 'customer':

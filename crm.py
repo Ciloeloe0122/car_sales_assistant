@@ -113,6 +113,7 @@ class CRM:
 
         conn.commit()
         conn.close()
+
     # ==================== 用户认证 ====================
 
     def register_customer(self, phone: str, name: str, password: str) -> Optional[Dict[str, Any]]:
@@ -321,6 +322,12 @@ class CRM:
         """保存或更新客户画像"""
         conn = self._get_connection()
         cursor = conn.cursor()
+
+        # ⭐ 关键修复：把 conversation_summary 存入 notes
+        notes = profile_data.get('notes')
+        if not notes:
+            notes = profile_data.get('conversation_summary', '')
+
         cursor.execute('''
             INSERT OR REPLACE INTO customer_profile
             (customer_id, preferred_model, budget_range, purpose, key_demands, notes, updated_at)
@@ -331,7 +338,7 @@ class CRM:
             profile_data.get('budget_range'),
             profile_data.get('purpose'),
             profile_data.get('key_demands'),
-            profile_data.get('notes')
+            notes,  # 这里用处理后的 notes
         ))
         conn.commit()
         conn.close()
@@ -347,44 +354,45 @@ class CRM:
         return dict(row) if row else None
 
     # ==================== 智能画像分析（调用 DeepSeek） ====================
-
-    def analyze_customer_from_conversations(
-        self,
-        conversations: List[Dict[str, str]],
-        openai_client: OpenAI
-    ) -> Optional[Dict[str, Any]]:
-        """基于历史对话提取客户画像"""
+    def analyze_customer_from_conversations(self, conversations, openai_client):
+        """
+        基于客户历史对话，使用 DeepSeek 提取结构化画像
+        :param conversations: list of dict，每个 dict 有 role 和 content
+        :param openai_client: OpenAI 客户端实例
+        :return: 包含画像信息的字典
+        """
         if not conversations:
             return None
 
         chat_text = "\n".join([
             f"{'客户' if msg['role'] == 'user' else '销售顾问'}: {msg['content']}"
-            for msg in conversations[-20:]
+            for msg in conversations[-30:]  # 扩展到最近30条
         ])
 
         prompt = f"""
-        你是一位资深的汽车销售数据分析师。请分析以下客户与销售顾问的对话记录，提取该客户的购车画像。
+你是一位资深的汽车销售数据分析师。请分析以下客户与销售顾问的对话记录，提取该客户的购车画像。
 
-        对话记录：
-        {chat_text}
+对话记录：
+{chat_text}
 
-        请以 JSON 格式返回以下信息（只返回 JSON，不要包含其他文字）：
-        {{
-            "preferred_model": "客户最感兴趣的车型，如果没有明确填'未知'",
-            "budget_range": "客户提到的预算范围，如'20-30万'，如果没提到填'未提及'",
-            "purpose": "用车场景：commuting(通勤)/business(商务)/family(家庭)/mixed(混合)，如果没明确填'未知'",
-            "key_demands": "客户最关注的3个方面，用逗号分隔，如'空间大,安全性高,省油'",
-            "notes": "补充说明，如客户提到的特殊需求或痛点"
-        }}
-        """
+请以 JSON 格式返回以下信息（只返回 JSON，不要包含其他文字）：
+{{
+    "preferred_model": "客户最感兴趣的车型，如果没有明确填'未知'",
+    "budget_range": "客户提到的预算范围，如'20-30万'，如果没提到填'未提及'",
+    "purpose": "用车场景：commuting(通勤)/business(商务)/family(家庭)/mixed(混合)，如果没明确填'未知'",
+    "key_demands": "客户最关注的3个方面，用逗号分隔，如'空间大,安全性高,省油'",
+    "conversation_summary": "用一段话（200-300字）完整回顾客户的购车对话过程，包括：客户提出了哪些问题、重点关注哪些车型或配置、表达过哪些顾虑和疑虑、对哪些功能表现出明显兴趣、最终是否明确了购买意向或倾向。要求条理清晰，让销售看完就能全面了解客户情况，便于后续跟进。"
+}}
+"""
 
         try:
             response = openai_client.chat.completions.create(
-                model="deepseek-v4-pro",
+                model="deepseek-v4-flash",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
                 response_format={"type": "json_object"}
             )
+            import json
             result = json.loads(response.choices[0].message.content)
             return result
         except Exception as e:
