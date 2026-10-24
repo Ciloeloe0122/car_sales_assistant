@@ -1,7 +1,4 @@
-"""
-CRM 模块 - 客户关系管理 + 用户认证
-包含：数据库初始化、客户/销售注册、登录、客户管理、画像分析
-"""
+
 import os
 import json
 import sqlite3
@@ -16,9 +13,14 @@ from openai import OpenAI
 class CRM:
     """CRM 核心类，封装所有数据库操作和业务逻辑"""
 
-    def __init__(self, db_path: str = "crm.db"):
-        self.db_path = db_path
-        self._init_db()
+
+    def __init__(self, db_path: str = None):
+            if db_path is None:
+                # 获取 crm.py 所在目录的绝对路径
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                db_path = os.path.join(base_dir, "crm.db")
+            self.db_path = db_path
+            self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
         """获取数据库连接"""

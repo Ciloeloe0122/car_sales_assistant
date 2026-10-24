@@ -20,8 +20,13 @@ from rank_bm25 import BM25Okapi
 from openai import OpenAI
 from dotenv import load_dotenv
 import markdown
+from hot_questions_manager import HotQuestionsManager
+import streamlit as st
+
 
 load_dotenv()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ==================== 配置 DeepSeek API ====================
 try:
@@ -39,90 +44,15 @@ client = OpenAI(
 )
 
 
-# ==================== 语义聚合版热门问题管理器 ====================
-class HotQuestionsManager:
-    def __init__(self, storage_file="data/hot_questions.json", similarity_threshold=0.45):
-        self.storage_file = storage_file
-        self.similarity_threshold = similarity_threshold
-        self.data = self._load()
-        self.vectorizer = None
-
-    def set_vectorizer(self, vectorizer):
-        self.vectorizer = vectorizer
-
-    def _load(self):
-        if os.path.exists(self.storage_file):
-            try:
-                with open(self.storage_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except:
-                return {"topics": {}, "daily": {}}
-        return {"topics": {}, "daily": {}}
-
-    def _save(self):
-        os.makedirs(os.path.dirname(self.storage_file), exist_ok=True)
-        with open(self.storage_file, 'w', encoding='utf-8') as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-
-    def _normalize(self, text):
-        text = text.strip().rstrip("？?").strip()
-        return text
-
-    def _find_similar_topic(self, question):
-        if not self.data["topics"] or self.vectorizer is None:
-            return None, 0.0
-        existing_topics = list(self.data["topics"].keys())
-        if not existing_topics:
-            return None, 0.0
-        question_vec = self.vectorizer.transform([question])
-        topics_vec = self.vectorizer.transform(existing_topics)
-        similarities = cosine_similarity(question_vec, topics_vec).flatten()
-        best_idx = similarities.argmax()
-        best_score = similarities[best_idx]
-        if best_score >= self.similarity_threshold:
-            return existing_topics[best_idx], best_score
-        return None, 0.0
-
-    def record_question(self, question, client=None):
-        clean = self._normalize(question)
-        if not clean:
-            return
-        today = datetime.now().strftime("%Y-%m-%d")
-        similar_topic, _ = self._find_similar_topic(clean)
-        topic = similar_topic if similar_topic else clean
-
-        self.data["topics"][topic] = self.data["topics"].get(topic, 0) + 1
-        if today not in self.data["daily"]:
-            self.data["daily"][today] = {}
-        self.data["daily"][today][topic] = self.data["daily"][today].get(topic, 0) + 1
-
-        self._clean_old_data()
-        self._save()
-
-    def _clean_old_data(self):
-        cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-        to_delete = [d for d in self.data["daily"].keys() if d < cutoff]
-        for d in to_delete:
-            del self.data["daily"][d]
-        total = defaultdict(int)
-        for day, topics in self.data["daily"].items():
-            for topic, count in topics.items():
-                total[topic] += count
-        self.data["topics"] = dict(total)
-
-    def get_top_questions(self, n=5):
-        sorted_topics = sorted(self.data["topics"].items(), key=lambda x: x[1], reverse=True)
-        return [topic for topic, _ in sorted_topics[:n]]
-
-    def get_hot_score(self, question):
-        clean = self._normalize(question)
-        return self.data["topics"].get(clean, 0)
-
 
 # ==================== 数据加载与索引构建 ====================
 @st.cache_data
 def load_car_data():
     import csv
+
+    # 构建绝对路径
+    hongqi_path = os.path.join(BASE_DIR, "data", "hongqi_data.csv")
+    competitor_path = os.path.join(BASE_DIR, "data", "competitor_data.csv")
 
     # 读取红旗数据（用 pandas 读，因为格式相对规范）
     try:
@@ -195,7 +125,7 @@ def build_bm25_index(df, texts):
     return bm25
 
 
-# ==================== 检索函数 ====================
+# 检索函数
 def vector_search(query, vectorizer, vectors, df, top_n=5):
     query_vec = vectorizer.transform([query])
     similarities = cosine_similarity(query_vec, vectors).flatten()
@@ -217,19 +147,43 @@ def bm25_search(query, bm25, df, texts, top_n=5):
 def search_car(query, vectorizer, vectors, bm25, df, texts, top_n=3):
     query_lower = query.lower()
 
-    # 1. 多车型对比召回
-    car_keywords = ['h9', 'h5', 'hs5', 'hs7', 'h6', 'eqm5', 'ehs9', 'hs3', 'hq9']
-    matched_cars = [kw for kw in car_keywords if kw in query_lower]
+    # ==================== 1. 动态实体提取 + 多车型对比召回 ====================
+    matched_cars = []
+    # 动态获取数据库中所有不重复的车型名称
+    all_models = df['车型'].dropna().unique()
 
+    import re
+    for model in all_models:
+        model_str = str(model).strip()
+        model_lower = model_str.lower()
+
+        # 策略A：完整匹配（例如用户输入了“红旗H5”或“凯美瑞”）
+        if model_lower in query_lower:
+            matched_cars.append(model_str)
+            continue
+
+        # 策略B：匹配英文字母或数字部分（例如库里是“红旗H5”，用户只说了“H5”）
+        eng_part = re.search(r'[a-zA-Z0-9]+', model_lower)
+        if eng_part:
+            part_str = eng_part.group()
+            # 过滤掉单字母或太短的，防止误伤（比如匹配到'5'）
+            if len(part_str) >= 2 and part_str in query_lower:
+                matched_cars.append(model_str)
+
+    # 去重
+    matched_cars = list(set(matched_cars))
+
+    # 如果识别到两个及以上车型，触发对比召回
     if len(matched_cars) >= 2:
         condition = pd.Series([False] * len(df))
         for car in matched_cars:
-            condition = condition | df['车型'].str.lower().str.contains(car, na=False)
+            # 精确匹配车型名，把所有相关的版本都捞出来
+            condition = condition | (df['车型'].str.strip() == car)
         result_df = df[condition].copy()
         if not result_df.empty:
             return result_df, texts, matched_cars
 
-    # 2. 数值排序兜底
+    # ==================== 2. 数值排序兜底 ====================
     numeric_keywords = {
         "最贵": ("指导价(万元)", False),
         "最便宜": ("指导价(万元)", True),
@@ -252,7 +206,7 @@ def search_car(query, vectorizer, vectors, bm25, df, texts, top_n=3):
                     result_df = full_df.head(top_n)
                     return result_df, texts, matched_cars
 
-    # 3. 多路召回 (向量 + BM25)
+    # ==================== 3. 多路召回 (向量 + BM25) ====================
     vec_results = vector_search(query_lower, vectorizer, vectors, df, top_n=5)
     bm25_results = bm25_search(query_lower, bm25, df, texts, top_n=5)
 
@@ -266,12 +220,13 @@ def search_car(query, vectorizer, vectors, bm25, df, texts, top_n=3):
 
     result_df = df.iloc[merged_indices].head(top_n)
     return result_df, texts, matched_cars
-
-
 def log_user_interaction(session_id, customer_id, user_input, ai_response, retrieved_models, matched_cars):
-    log_file = "data/user_logs.csv"
+    log_file = os.path.join(BASE_DIR, "data", "user_logs.csv")
     file_exists = os.path.exists(log_file)
     header = ["timestamp", "session_id", "customer_id", "user_input", "ai_response", "retrieved_models", "matched_cars"]
+
+    # 确保 data 目录存在
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
 
     with open(log_file, mode='a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -286,7 +241,6 @@ def log_user_interaction(session_id, customer_id, user_input, ai_response, retri
             ", ".join(retrieved_models) if retrieved_models else "",
             ", ".join(matched_cars) if matched_cars else ""
         ])
-
 
 def get_customer_conversations(customer_id):
     """
@@ -391,43 +345,31 @@ def generate_response(query, results_df, texts, history_messages=None):
     # 构建对话消息列表
     messages = [
         {"role": "system", "content": """
-    你是红旗汽车的AI销售顾问，具备以下核心原则和策略：
+    你是一名红旗4S店的金牌销售。你专业、真诚，懂得把冷冰冰的参数转化为客户未来的生活画面（场景化营销）。
 
-    【第一原则：只推红旗】
-    - 你只推荐红旗品牌车型，绝不推荐任何竞品（如奥迪、比亚迪、丰田等）。
-    - 当用户问对比时，只提供客观参数差异（如价格、尺寸、配置），但结论必须导向红旗的优势。
-    - 严禁说"也可以考虑XX品牌"或"如果预算不够可以看XX"。
+    【一、绝对红线（违反即失职）】
+    1. 严禁推荐非红旗品牌。当客户提到竞品时，绝对不准列举竞品优点（如智驾好、续航长），只能客观对比，并落脚在红旗的优势上（如内饰更豪华、底盘更稳、无续航焦虑）。
+    2. 严禁编造具体数值。如果参考数据里没有真实油耗、选装价格，话术标准：“油耗受路况和驾驶习惯影响很大，我无法给您绝对准确的数字。建议您到店试驾，看试驾车的表显数据最真实。”绝对不要引导客户去第三方汽车平台。
+    3. 只能基于【参考数据】回答。如果数据为空，请使用兜底话术：“这款车的细节我这边暂时没有完整参数，不过红旗在这个级别一直做得很好，您可以来店里详细看看。”
 
-    【财务问题的处理准则】
-    - 对于价格、落地价、购置税、保险、分期付款等涉及具体金额的问题，你**绝对不能编造数字**。
-    - 如果你在检索到的数据中有明确的指导价，可以直接告诉用户指导价是多少。
-    - 对于落地价（含税、保险等），必须明确告知："落地价需要到店根据当地政策和优惠核算，建议您到店详谈。"
-    - 对于分期方案（首付、月供等），必须说："分期政策因经销商而异，具体方案需要到店咨询您的金融专员。"
-    - 严禁给出任何具体的估算数字（如"月供大概3000元"、"首付约5万"），除非数据中有明确标注。
-    - 如果用户追问，统一回应："非常抱歉，金融政策实时变动，我无法提供准确数字。建议您到店，我们的金融顾问会为您做精确报价。"
+    【二、话术风格：自然种草，拒绝模板】
+    1. 绝对不要使用“专业解答”、“场景描绘”、“第一、第二”这类生硬的小标题！不要分点列出！要写成一段连贯、自然、像面对面聊天一样的话。
+    2. 你的回答逻辑应该是：先顺着客户的需求给予肯定，然后自然地抛出参数对比，最后用一两句话，把参数转化为客户未来的生活画面。
+    3. 过渡要自然，多用“其实您想想”、“比如周末”、“想象一下”这种口语化的词，不知不觉把客户代入场景。
 
-    【资料库缺失时的话术策略】
-    当用户问的车型不在资料库中时，按以下步骤处理：
-    1. 先如实说明："不好意思，我这边暂时没有该车型的详细参数资料。"
-    2. 然后转向推荐红旗同级别或相近价位车型："但如果您对中大型轿车感兴趣，我可以为您介绍红旗H9/H5等车型，它们在空间和配置上都非常出色。"
-    3. 结尾不要主动邀约，只留一个开放式结尾："如果您想了解更多，可以随时再问我。"或者“期待您的下一次提问。”
+    【三、场景化话术指南（内化到回答中，不要照抄）】
+    * 当聊到空间/轴距：“这车轴距快3米了，您想想，周末带家人去露营，后排装上儿童座椅，老婆还能轻松跷个二郎腿，后备箱塞下推车和帐篷都不费劲，这就是实实在在的从容。”
+    * 当聊到动力/操控：“想象一下在高速上超车，您深踩一脚油门，动力随叫随到，干脆利落，底盘稳稳贴地，家里人坐后排也不会觉得晃。”
+    * 当聊到配置/豪华：“下班接完老婆，打开氛围灯放首喜欢的歌，在这个私密空间里，一天的疲惫就卸下来了。”
 
-    【结尾策略（根据对话阶段灵活选择，不要每次都用同一套）】
-    - 初次回答（用户只问了一个简单问题）：直接结束，不加邀约。例："如果您还有其他问题，随时可以问我。"
-    - 用户表现出兴趣（问了2个以上问题，或追问细节）：温和结尾。例："如果您想进一步了解，也可以到店亲自体验一下。"
-    - 用户明确有购买意向（问价格、金融方案、库存等）：可以主动邀约。例："建议您到店试驾感受一下，我可以帮您预约。"
-
-    【回答风格】
-    - 专业、热情、自然，像朋友在聊天，不要像机器人念稿。
-    - 内容要简洁，不要列大段参数。
-    - 根据问题的复杂程度决定回答长度，简单问题简短回答，复杂问题详细回答。
+    【四、说话风格】
+    - 称呼客户为“您”，绝对禁止使用“兄弟”、“老哥”等江湖气称呼。
+    - 保持精简，不要长篇大论，就像面对面聊天一样。
     """}
     ]
 
     # 添加历史对话（只取最近 6 条，避免上下文过长）
     if history_messages:
-        # history_messages 是 list of dict，每个 dict 有 role 和 content
-        # 只取最近 6 条（3轮对话）
         for msg in history_messages[-6:]:
             messages.append(msg)
 
@@ -919,9 +861,16 @@ texts = build_texts(df)
 vectorizer, vectors, _ = build_vector_index(df)
 bm25 = build_bm25_index(df, texts)
 
-# ===== 初始化热门问题管理器（注入向量化器） =====
-hot_mgr = HotQuestionsManager()
-hot_mgr.set_vectorizer(vectorizer)
+
+# ===== 初始化热门问题管理器（使用全局状态，跨用户同步） =====
+# 使用官方全局缓存，所有用户共享同一个实例
+@st.cache_resource
+def get_global_hot_mgr():
+    return HotQuestionsManager(storage_file=os.path.join(BASE_DIR, "data", "hot_questions.json"))
+
+hot_mgr = get_global_hot_mgr()
+
+
 
 st.markdown("""
 <div class="brand-banner">
@@ -1043,7 +992,7 @@ with st.sidebar:
                             if result:
                                 st.session_state.user = result
                                 # ⭐ 新增：重置聊天记录
-                                t.session_state.messages = [{"role": "assistant",
+                                st.session_state.messages = [{"role": "assistant",
                                                              "content": "你好，我是红旗 AI 销售顾问。请问你想了解哪款红旗车型？"}]
                                 st.session_state.quick_question = None
                                 st.session_state.pending_question = None
