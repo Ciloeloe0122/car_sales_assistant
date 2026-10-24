@@ -1,0 +1,4 @@
+data/user_logs.csv
+data/hot_questions.json
+__pycache__/
+.env
