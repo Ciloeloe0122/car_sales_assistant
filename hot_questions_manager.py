@@ -223,12 +223,12 @@ class HotQuestionsManager:
             if intent != "通用":
                 break
 
-        if not car:
-            # 无车型，去掉常见词保留核心
-            clean_core = re.sub(r'多少钱|价格|报价|配置|推荐|适合|怎么样|好不好', '', clean)
-            if len(clean_core) > 2:
-                return f"其他_问题_{clean_core[:10]}"
-            return f"其他_问题_{clean[:10]}"
+        if  not car:
+            # 如果识别到了意图（比如推荐、价格、对比），直接用意图做键
+            if intent != "通用":
+                return f"无车型_{intent}"
+            # 如果连意图都没有，就交给大模型去提炼短标签（直接用前5个字兜底）
+            return clean[:5]
 
         return f"{car}_{intent}"
 
@@ -323,37 +323,45 @@ class HotQuestionsManager:
             summary = summary[:12] + "..."
         return summary
 
+
     def _summarize_with_ai(self, question, client=None):
         """
-        使用 AI 将长问题压缩成短句（≤15字）
-        如果 AI 失败，使用规则提炼
+        双保险提炼：
+        第一道：大模型提炼（聪明）。
+        第二道：如果大模型异常/没传client，走本地规则兜底（稳定）。
         """
-        # 先尝试 AI 提炼
+        clean = question.strip().rstrip("？?").strip()
+        if not clean:
+            return "购车咨询"
+
+        # 第一道防线：大模型提炼
         if client:
             try:
-                prompt = f"""请将以下用户购车问题压缩成一句话（10个字以内），保留核心意图（车型和关键诉求）。
-    只输出压缩后的一句话，不要其他内容。
+                prompt = f"""你是一个汽车销售系统的标题助手。请将用户的提问提炼成10个字以内的核心短标题，保留“车型”和“核心意图”。
+要求：只输出提炼后的短标题，不要任何标点符号和解释。
+例如：
+用户问：红旗H5的1.5T发动机市区堵车到底几个油？
+输出：红旗H5 油耗
 
-    原始问题：{question}
-    压缩后："""
+用户提问：{clean}
+输出："""
                 response = client.chat.completions.create(
                     model="deepseek-v4-flash",
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3,
-                    max_tokens=30
+                    temperature=0.1,
+                    max_tokens=20
                 )
                 summary = response.choices[0].message.content.strip()
+                summary = summary.replace("输出：", "").replace("标题：", "").strip()
+
                 if summary and len(summary) <= 20:
                     return summary
-                if summary and len(summary) > 20:
-                    return summary[:18] + "..."
             except Exception as e:
-                # AI 调用失败，静默跳过，走规则提炼
-                pass
+                # 大模型挂了，静默记录错误，准备走兜底
+                print(f"[提示] AI提炼失败，启用本地规则兜底: {e}")
 
-        # 规则提炼（保证一定有返回值）
-        return self._rule_based_summary(question)
-
+        # 第二道防线：本地字典兜底（保留了你之前写的 _rule_based_summary）
+        return self._rule_based_summary(clean)
     def _get_best_display_text(self, question, normalized_key):
         """从同组问题中选一个展示文本（保留原用法）"""
         candidates = self.data["questions"].get(normalized_key, {}).get("variants", [])
@@ -371,8 +379,8 @@ class HotQuestionsManager:
 
         normalized_key = self._normalize_question(clean)
 
-        #  强制生成 display（不依赖 AI，直接用规则）
-        display_name = self._rule_based_summary(clean)
+        #  强制生成 display（大模型优先，失败自动走规则）
+        display_name = self._summarize_with_ai(clean, client=client)
         if len(display_name) > 20:
             display_name = display_name[:18] + "..."
 
@@ -424,7 +432,7 @@ class HotQuestionsManager:
             total[key]["variants"] = list(set(total[key]["variants"]))
         self.data["questions"] = dict(total)
 
-    def get_top_questions(self, n=5):
+    def get_top_questions(self, n=5, client=None):
         sorted_items = sorted(
             self.data["questions"].items(),
             key=lambda x: x[1]["count"] if isinstance(x[1], dict) else x[1],
@@ -436,28 +444,17 @@ class HotQuestionsManager:
             if isinstance(info, dict):
                 count = info.get("count", 0)
                 variants = info.get("variants", [])
-                display = ""
 
-                # ⭐ 智能挑选：优先从用户原话里挑一句长度 6~16 个字，最像自然提问的
+                # ⭐ 强制实时提炼，忽略 JSON 里可能存错的 display
                 if variants:
-                    # 按长度排序，优先选长度适中的
-                    sorted_variants = sorted(variants, key=lambda x: abs(len(x) - 12))
-                    for v in sorted_variants:
-                        # 如果这句话长度适中，且包含问号或疑问词，直接用它！
-                        if 6 <= len(v) <= 18 and any(q in v for q in ["吗", "多少", "怎么", "哪个", "么"]):
-                            display = v.replace("？", "").replace("?", "")
-                            break
-
-                    # 如果挑不到，就用规则提炼作为兜底
-                    if not display:
-                        display = self._rule_based_summary(sorted_variants[0])
+                    display = self._summarize_with_ai(variants[0], client=client)
                 else:
-                    display = self._rule_based_summary(key)
+                    display = self._summarize_with_ai(key, client=client)
             else:
                 count = info
-                display = self._rule_based_summary(key)
+                display = self._summarize_with_ai(key, client=client)
 
-            # 强制截断防止意外
+            # 强制截断
             if len(display) > 20:
                 display = display[:18] + "..."
 
